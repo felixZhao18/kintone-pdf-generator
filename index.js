@@ -1,242 +1,528 @@
 // ==========================================================================
-// 1. 外部ライブラリ（html2pdf.js）の動的インジェクション
+// 1. 外部ライブラリ（html2pdf.js）の読み込み待機
 // ==========================================================================
-// グローバル環境に html2pdf が未定義の場合、CDN経由でスクリプトを非同期ロードします。
-if (typeof html2pdf === 'undefined') {
-  const script = document.createElement('script');
-  // メインのCDN（jsdelivr）からライブラリを取得
-  script.src = 'https://cdn.jsdelivr.net/npm/html2pdf.js@0.10.1/dist/html2pdf.bundle.min.js';
-  
-  // メインCDNの読み込みに失敗した場合のフォールバック（代替）処理
-  script.onerror = () => {
-    const backupScript = document.createElement('script');
-    backupScript.src = 'https://unpkg.com/html2pdf.js@0.10.1/dist/html2pdf.bundle.min.js';
-    document.head.appendChild(backupScript);
+window.__html2pdfLoadPromise = window.__html2pdfLoadPromise || new Promise((resolve, reject) => {
+  const startTime = Date.now();
+  const TIMEOUT_MS = 15000;
+  const check = () => {
+    if (typeof html2pdf !== 'undefined') {
+      resolve();
+      return;
+    }
+    if (Date.now() - startTime > TIMEOUT_MS) {
+      reject(new Error(
+        'html2pdf.js が読み込まれていません。kintoneの「JS/CSSで外観を変更する」設定を確認してください。'
+      ));
+      return;
+    }
+    setTimeout(check, 100);
   };
-  document.head.appendChild(script);
-}
+  check();
+});
 
 (() => {
   'use strict';
 
-  // ==========================================================================
-  // 2. kintone イベントリスナー：レコード詳細画面の表示時
-  // ==========================================================================
-  kintone.events.on('app.record.detail.show', event => {
-    const record = event.record;
+  const formatDatetime = (isoString) => {
+    if (!isoString) return '----/--/-- --:--';
+    const date = new Date(isoString);
+    if (isNaN(date.getTime())) return isoString;
     
-    // フォーム設定で配置したスペース「preview」の要素を取得
-    const previewSpace = kintone.app.record.getSpaceElement('preview');
-    if (!previewSpace) return; // スペースが存在しない場合は処理を中断
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, '0');
+    const d = String(date.getDate()).padStart(2, '0');
+    const hh = String(date.getHours()).padStart(2, '0');
+    const mm = String(date.getMinutes()).padStart(2, '0');
+    
+    return `${y}-${m}-${d} ${hh}:${mm}`;
+  };
 
-    // 重複描画を防ぐため、スペース内のコンテンツを初期化
-    previewSpace.innerHTML = '';
+  const escapeHtml = (str) => {
+    if (!str) return '';
+    return str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  };
 
-    // --- PDFプレビュー生成用ボタンの作成とスタイリング ---
-    const btn = document.createElement('button');
-    btn.innerHTML = '📄 PDFプレビューを表示する';
-    btn.style.padding = '12px 24px';
-    btn.style.fontSize = '14px';
-    btn.style.fontWeight = 'bold';
-    btn.style.color = '#fff';
-    btn.style.backgroundColor = '#2c3e50';
-    btn.style.border = 'none';
-    btn.style.borderRadius = '4px';
-    btn.style.cursor = 'pointer';
-    btn.style.boxShadow = '0 2px 6px rgba(0,0,0,0.15)';
-    btn.style.transition = 'all 0.2s ease';
-    btn.style.margin = '10px 0';
+  const formatParagraphs = (str) => {
+    if (!str) return '';
+    const lines = str.split('\n');
+    return lines.map(line => {
+      const escaped = escapeHtml(line);
+      if (!escaped.trim()) {
+        return '<div style="height: 8px;"></div>';
+      }
+      return `<p class="pdf-p-block" style="margin: 0 0 6px 0; line-height: 1.5; page-break-inside: avoid !important; break-inside: avoid !important;">${escaped}</p>`;
+    }).join('');
+  };
 
-    // ボタンのホバーエフェクト（マウスオーバー時）
-    btn.onmouseover = () => { btn.style.backgroundColor = '#34495e'; };
-    btn.onmouseout = () => { btn.style.backgroundColor = '#2c3e50'; };
+  const showToast = (message) => {
+    if (document.getElementById('limit-warning-toast')) return;
+    const toast = document.createElement('div');
+    toast.id = 'limit-warning-toast';
+    toast.innerHTML = message;
+    toast.style.position = 'fixed';
+    toast.style.bottom = '20px';
+    toast.style.left = '50%';
+    toast.style.transform = 'translateX(-50%)';
+    toast.style.backgroundColor = '#e74c3c';
+    toast.style.color = '#fff';
+    toast.style.padding = '12px 24px';
+    toast.style.borderRadius = '4px';
+    toast.style.boxShadow = '0 4px 12px rgba(0,0,0,0.15)';
+    toast.style.zIndex = '99999';
+    toast.style.fontSize = '14px';
+    toast.style.fontWeight = 'bold';
+    document.body.appendChild(toast);
+    
+    setTimeout(() => {
+      toast.remove();
+    }, 4000);
+  };
 
-    // ボタンクリック時のイベント：多重クリック防止と処理中ステータスへの切り替え
-    btn.onclick = () => {
-      btn.disabled = true;
-      btn.innerHTML = '⏳ PDF生成中...';
-      btn.style.backgroundColor = '#95a5a6';
+ // 顛末書タイプの書類かどうかを判定するヘルパー関数
+  const isTenmatsuStyleType = (docType) => {
+    return [
+      '顛末書',
+      'セキュリティインシデント・情報セキュリティ事象報告',
+      '障害報告書'
+    ].includes(docType);
+  };
+
+  // ==========================================================================
+  // 2. 行数制限のイベントバインド（各新フィールドに対応）
+  // ==========================================================================
+  const registerLimitListener = () => {
+    const bindInterval = setInterval(() => {
+      const textareas = document.querySelectorAll('textarea');
       
-      // 実際のPDF生成および描画ロジック関数を実行
-      generateReportPDF(record, previewSpace);
-    };
+      textareas.forEach((textarea) => {
+        if (textarea.dataset.boundLimit) return;
 
-    // 準備したボタンをkintoneのスペース内に配置
-    previewSpace.appendChild(btn);
+        const fieldContainer = textarea.closest('.field-gaia, .control-value-gaia, div');
+        const containerText = fieldContainer ? fieldContainer.innerText || '' : '';
+
+        let maxLines = 25;
+        if (containerText.includes('事象の概要') || containerText.includes('報告内容')) {
+          maxLines = 50;
+        } else if (containerText.includes('原因') || containerText.includes('暫定対処') || containerText.includes('本格対処') || containerText.includes('再発防止') || containerText.includes('感想') || containerText.includes('備考')) {
+          maxLines = 20;
+        }
+
+        textarea.dataset.boundLimit = 'true';
+        let lastVal = textarea.value;
+
+        textarea.addEventListener('input', () => {
+          const lines = textarea.value.split('\n').length;
+
+          if (lines > maxLines) {
+            textarea.value = lastVal;
+            showToast(`⚠️ 枠内に収めるため、これ以上入力できません（最大 ${maxLines} 行まで）。`);
+          } else {
+            lastVal = textarea.value;
+          }
+        });
+      });
+
+    }, 300);
+
+    setTimeout(() => clearInterval(bindInterval), 15000);
+  };
+
+  // ==========================================================================
+  // 3. 画面制御（顛末書系：暫定対処・本格対処・再発防止策を表示）
+  // ==========================================================================
+  const toggleFieldsVisibility = (record) => {
+    const documentType = record?.書類種別?.value || '報告書';
+
+    const reportFields = ['対象', '実施場所', '実施開始日', '実施終了日', '報告内容', '感想', '備考'];
+    const tenmatsuFields = ['発生日時', '発生場所', '事象の概要', '原因', '暫定対処', '本格対処', '再発防止策'];
+
+    const isTenmatsuStyle = isTenmatsuStyleType(documentType);
+
+    if (isTenmatsuStyle) {
+      reportFields.forEach(field => kintone.app.record.setFieldShown(field, false));
+      tenmatsuFields.forEach(field => kintone.app.record.setFieldShown(field, true));
+      kintone.app.record.setFieldShown('添付資料', true);
+    } else {
+      reportFields.forEach(field => kintone.app.record.setFieldShown(field, true));
+      tenmatsuFields.forEach(field => kintone.app.record.setFieldShown(field, false));
+      kintone.app.record.setFieldShown('添付資料', false);
+    }
+
+    setTimeout(() => {
+      const attachEl = kintone.app.record.getFieldElement('添付資料');
+      if (attachEl) {
+        attachEl.style.display = isTenmatsuStyle ? '' : 'none';
+      }
+    }, 100);
+  };
+
+  const showEvents = [
+    'app.record.detail.show',
+    'app.record.create.show',
+    'app.record.edit.show',
+    'app.record.print.show'
+  ];
+  kintone.events.on(showEvents, event => {
+    const record = event.record;
+    toggleFieldsVisibility(record);
+    
+    if (event.type === 'app.record.create.show' || event.type === 'app.record.edit.show') {
+      registerLimitListener();
+    }
+    
+    if (event.type === 'app.record.detail.show') {
+      const previewSpace = kintone.app.record.getSpaceElement('preview');
+      if (previewSpace) {
+        previewSpace.innerHTML = '';
+        const btn = document.createElement('button');
+        btn.innerHTML = '📄 PDFプレビューを表示する';
+        btn.style.padding = '12px 24px';
+        btn.style.fontSize = '14px';
+        btn.style.fontWeight = 'bold';
+        btn.style.color = '#fff';
+        btn.style.backgroundColor = '#2c3e50';
+        btn.style.border = 'none';
+        btn.style.borderRadius = '4px';
+        btn.style.cursor = 'pointer';
+        btn.style.boxShadow = '0 2px 6px rgba(0,0,0,0.15)';
+        btn.style.transition = 'all 0.2s ease';
+        btn.style.margin = '10px 0';
+
+        btn.onmouseover = () => { btn.style.backgroundColor = '#34495e'; };
+        btn.onmouseout = () => { btn.style.backgroundColor = '#2c3e50'; };
+
+        btn.onclick = () => {
+          if (window.__pdfGenerating) return;
+          window.__pdfGenerating = true;
+
+          document.querySelectorAll('#pdf-sandbox-container').forEach(el => el.remove());
+
+          btn.disabled = true;
+          btn.innerHTML = '⏳ PDF生成中...';
+          btn.style.backgroundColor = '#95a5a6';
+          generateReportPDF(record, previewSpace, btn);
+        };
+        previewSpace.appendChild(btn);
+      }
+    }
+    return event;
+  });
+
+  const changeEvents = [
+    'app.record.create.change.書類種別',
+    'app.record.edit.change.書類種別'
+  ];
+  kintone.events.on(changeEvents, event => {
+    toggleFieldsVisibility(event.record);
+    return event;
   });
 
   // ==========================================================================
-  // 3. PDF生成・描画のコアロジック関数
+  // 4. PDF生成・描画のコアロジック関数
   // ==========================================================================
-  const generateReportPDF = (record, previewSpace) => {
-    // レコードからアプリのタイトルを取得（未入力の場合はデフォルト値を使用）
-    const title = record.アプリタイトル?.value || '業務報告書';
+  const generateReportPDF = (record, previewSpace, triggerBtn) => {
+    const documentType = record.書類種別?.value || '報告書';
+    const isTenmatsuStyle = isTenmatsuStyleType(documentType);
+    const appTitle = documentType; // PDF標題將自動填入選取的選項名稱
     
-    // --- 【データ抽出】作成者（ユーザー選択フィールド）の解析 ---
-    // kintoneの仕様上、オブジェクトや配列で返されるため、型判定を行いユーザー名を確実に抽出します。
     let author = '未設定';
     if (record.作成者?.value) {
       if (Array.isArray(record.作成者.value) && record.作成者.value.length > 0) {
         author = record.作成者.value[0].name || record.作成者.value[0].code || '未設定';
       } else if (typeof record.作成者.value === 'object') {
         author = record.作成者.value.name || '未設定';
-      } else if (typeof record.作成者.value === 'string') {
-        author = record.作成者.value;
       }
     }
     
-    // --- 【データ抽出】所属部署（組織選択フィールド）の解析 ---
     let department = '未設定';
     if (record.組織選択?.value && record.組織選択.value.length > 0) {
       department = record.組織選択.value[0].name || '未設定';
     }
-    
-    // --- 【数据抽出】4つの基本情報項目（フィールドコードのバリエーションに対応） ---
-    // 任意のフィールド名と、kintoneが自動生成するデフォルトのフィールドコードの両方を互換サポートします。
-    const target = record.対象?.value || record.文字列__1行__1?.value || ''; 
-    const startDate = record.実施開始日?.value || record.日付__0?.value || '----/--/--';
-    const endDate = record.実施終了日?.value || record.日付__1?.value || '----/--/--';
-    const place = record.実施場所?.value || record.文字列__1行__0?.value || '';
 
-    // --- 【データ抽出】本文および動的表示項目（感想・備考） ---
-    const reportContent = record.リッチエディター?.value || '<p>報告内容は空です。</p>';
-    const kansou = record.文字列__複数行_?.value?.trim() || record.感想?.value?.trim() || '';
-    const bikou = record.文字列__複数行__0?.value?.trim() || record.備考?.value?.trim() || '';
+    let middleTableHtml = ''; 
+    let mainBodyHtml = '';  
+    let additionalContentHtml = '';
 
-    // --- 【動的HTML制御】「感想」の表示有無判定 ---
-    // データが存在する場合のみ、見出しと枠線付きのHTMLブロックを生成します（空の場合はレンダリング領域自体を非表示に）。
-    let kansouHtml = '';
-    if (kansou) {
-      kansouHtml = `
-        <div style="margin-top: 25px;">
-          <h3 style="background: #2c3e50; color: #fff; padding: 10px 15px; margin: 0 0 15px 0; font-size: 15px; border-radius: 4px; font-weight: bold;">感想</h3>
-          <div style="border: 1px solid #bdc3c7; padding: 20px; background: #ffffff; word-wrap: break-word; white-space: pre-wrap;">${kansou}</div>
+    if (isTenmatsuStyle) {
+      const rawOccurDate = record.発生日時?.value || '';
+      const occurDate = formatDatetime(rawOccurDate);
+      const occurPlace = escapeHtml(record.発生場所?.value || '');
+      
+      const summaryFormatted = formatParagraphs(record.事象の概要?.value || '事象の概要は空です。');
+      const reasonFormatted = formatParagraphs(record.原因?.value?.trim() || '');
+      
+      const zanteiFormatted = formatParagraphs(record.暫定対処?.value?.trim() || '');
+      const honkakuFormatted = formatParagraphs(record.本格対処?.value?.trim() || '');
+      const saihatsuFormatted = formatParagraphs(record.再発防止策?.value?.trim() || '');
+
+      middleTableHtml = `
+        <table style="width: 100%; border-collapse: collapse; margin-bottom: 15px; font-size: 13px;">
+          <tr>
+            <th style="border: 1px solid #dcdfe6; background: #f5f7fa; padding: 8px; width: 15%; text-align: left; font-weight: bold; color: #606266;">報告者</th>
+            <td style="border: 1px solid #dcdfe6; padding: 8px; width: 35%; color: #303133;">${escapeHtml(author)}</td>
+            <th style="border: 1px solid #dcdfe6; background: #f5f7fa; padding: 8px; width: 15%; text-align: left; font-weight: bold; color: #606266;">所属部署</th>
+            <td style="border: 1px solid #dcdfe6; padding: 8px; width: 35%; color: #303133;">${escapeHtml(department)}</td>
+          </tr>
+          <tr>
+            <th style="border: 1px solid #dcdfe6; background: #f5f7fa; padding: 8px; text-align: left; font-weight: bold; color: #606266;">発生日時</th>
+            <td style="border: 1px solid #dcdfe6; padding: 8px; color: #303133;">${occurDate}</td>
+            <th style="border: 1px solid #dcdfe6; background: #f5f7fa; padding: 8px; text-align: left; font-weight: bold; color: #606266;">発生場所</th>
+            <td style="border: 1px solid #dcdfe6; padding: 8px; color: #303133;">${occurPlace}</td>
+          </tr>
+        </table>
+      `;
+
+      mainBodyHtml = `
+        <div class="section-group" style="margin-top: 10px;">
+          <h3 style="background: #2c3e50; color: #fff; padding: 6px 12px; margin: 0 0 8px 0; font-size: 14px; border-radius: 4px; font-weight: bold;">事象の概要（顛末）</h3>
+          <div style="border: 1px solid #dcdfe6; padding: 12px 15px 6px 15px; background: #ffffff; border-radius: 4px; color: #303133; font-size: 13.5px;">
+            ${summaryFormatted}
+          </div>
         </div>
       `;
-    }
 
-    // --- 【動的HTML制御】「備考」の表示有無判定 ---
-    // 「感想」と同様に、値がある場合のみHTMLを組み立てます。
-    let bikouHtml = '';
-    if (bikou) {
-      bikouHtml = `
-        <div style="margin-top: 25px;">
-          <h3 style="background: #2c3e50; color: #fff; padding: 10px 15px; margin: 0 0 15px 0; font-size: 15px; border-radius: 4px; font-weight: bold;">備考</h3>
-          <div style="border: 1px solid #bdc3c7; padding: 20px; background: #ffffff; word-wrap: break-word; white-space: pre-wrap;">${bikou}</div>
+      let reasonHtml = reasonFormatted ? `
+        <div class="section-group" style="margin-top: 15px;">
+          <h3 style="background: #2c3e50; color: #fff; padding: 6px 12px; margin: 0 0 8px 0; font-size: 14px; border-radius: 4px; font-weight: bold;">発生原因</h3>
+          <div style="border: 1px solid #dcdfe6; padding: 10px 12px 4px 12px; background: #ffffff; border-radius: 4px; color: #303133; font-size: 13.5px;">
+            ${reasonFormatted}
+          </div>
+        </div>
+      ` : '';
+
+      let zanteiHtml = zanteiFormatted ? `
+        <div class="section-group" style="margin-top: 15px; page-break-inside: avoid !important; break-inside: avoid !important;">
+          <h3 style="background: #2c3e50; color: #fff; padding: 6px 12px; margin: 0 0 8px 0; font-size: 14px; border-radius: 4px; font-weight: bold;">暫定対処</h3>
+          <div style="border: 1px solid #dcdfe6; padding: 10px 12px 4px 12px; background: #ffffff; border-radius: 4px; color: #303133; font-size: 13.5px;">
+            ${zanteiFormatted}
+          </div>
+        </div>
+      ` : '';
+
+      let honkakuHtml = honkakuFormatted ? `
+        <div class="section-group" style="margin-top: 15px; page-break-inside: avoid !important; break-inside: avoid !important;">
+          <h3 style="background: #2c3e50; color: #fff; padding: 6px 12px; margin: 0 0 8px 0; font-size: 14px; border-radius: 4px; font-weight: bold;">本格対処</h3>
+          <div style="border: 1px solid #dcdfe6; padding: 10px 12px 4px 12px; background: #ffffff; border-radius: 4px; color: #303133; font-size: 13.5px;">
+            ${honkakuFormatted}
+          </div>
+        </div>
+      ` : '';
+
+      let saihatsuHtml = saihatsuFormatted ? `
+        <div class="section-group" style="margin-top: 15px; page-break-inside: avoid !important; break-inside: avoid !important;">
+          <h3 style="background: #2c3e50; color: #fff; padding: 6px 12px; margin: 0 0 8px 0; font-size: 14px; border-radius: 4px; font-weight: bold;">再発防止策</h3>
+          <div style="border: 1px solid #dcdfe6; padding: 10px 12px 4px 12px; background: #ffffff; border-radius: 4px; color: #303133; font-size: 13.5px;">
+            ${saihatsuFormatted}
+          </div>
+        </div>
+      ` : '';
+
+      additionalContentHtml = reasonHtml + zanteiHtml + honkakuHtml + saihatsuHtml;
+
+    } else {
+      const target = escapeHtml(record.対象?.value || ''); 
+      const startDate = record.実施開始日?.value || '----/--/--';
+      const endDate = record.実施終了日?.value || '----/--/--';
+      const place = escapeHtml(record.実施場所?.value || '');
+      
+      const reportFormatted = formatParagraphs(record.報告内容?.value || '報告内容は空です。');
+      const kansouFormatted = formatParagraphs(record.感想?.value?.trim() || '');
+      const bikouFormatted = formatParagraphs(record.備考?.value?.trim() || '');
+
+      middleTableHtml = `
+        <table style="width: 100%; border-collapse: collapse; margin-bottom: 15px; font-size: 13px;">
+          <tr>
+            <th style="border: 1px solid #dcdfe6; background: #f5f7fa; padding: 8px; width: 15%; text-align: left; font-weight: bold; color: #606266;">作成者</th>
+            <td style="border: 1px solid #dcdfe6; padding: 8px; width: 35%; color: #303133;">${escapeHtml(author)}</td>
+            <th style="border: 1px solid #dcdfe6; background: #f5f7fa; padding: 8px; width: 15%; text-align: left; font-weight: bold; color: #606266;">所属部署</th>
+            <td style="border: 1px solid #dcdfe6; padding: 8px; width: 35%; color: #303133;">${escapeHtml(department)}</td>
+          </tr>
+          <tr>
+            <th style="border: 1px solid #dcdfe6; background: #f5f7fa; padding: 8px; text-align: left; font-weight: bold; color: #606266;">対象</th>
+            <td style="border: 1px solid #dcdfe6; padding: 8px; color: #303133;">${target}</td>
+            <th style="border: 1px solid #dcdfe6; background: #f5f7fa; padding: 8px; text-align: left; font-weight: bold; color: #606266;">実施場所</th>
+            <td style="border: 1px solid #dcdfe6; padding: 8px; color: #303133;">${place}</td>
+          </tr>
+          <tr>
+            <th style="border: 1px solid #dcdfe6; background: #f5f7fa; padding: 8px; text-align: left; font-weight: bold; color: #606266;">実施開始日</th>
+            <td style="border: 1px solid #dcdfe6; padding: 8px; color: #303133;">${startDate}</td>
+            <th style="border: 1px solid #dcdfe6; background: #f5f7fa; padding: 8px; text-align: left; font-weight: bold; color: #606266;">実施終了日</th>
+            <td style="border: 1px solid #dcdfe6; padding: 8px; color: #303133;">${endDate}</td>
+          </tr>
+        </table>
+      `;
+
+      mainBodyHtml = `
+        <div class="section-group" style="margin-top: 10px;">
+          <h3 style="background: #2c3e50; color: #fff; padding: 6px 12px; margin: 0 0 8px 0; font-size: 14px; border-radius: 4px; font-weight: bold;">報告内容</h3>
+          <div style="border: 1px solid #dcdfe6; padding: 12px 15px 6px 15px; background: #ffffff; border-radius: 4px; color: #303133; font-size: 13.5px;">
+            ${reportFormatted}
+          </div>
         </div>
       `;
+
+      let kansouHtml = kansouFormatted ? `
+        <div class="section-group" style="margin-top: 15px; page-break-inside: avoid !important; break-inside: avoid !important;">
+          <h3 style="background: #2c3e50; color: #fff; padding: 6px 12px; margin: 0 0 8px 0; font-size: 14px; border-radius: 4px; font-weight: bold;">感想</h3>
+          <div style="border: 1px solid #dcdfe6; padding: 10px 12px 4px 12px; background: #ffffff; border-radius: 4px; color: #303133; font-size: 13.5px;">
+            ${kansouFormatted}
+          </div>
+        </div>
+      ` : '';
+
+      let bikouHtml = bikouFormatted ? `
+        <div class="section-group" style="margin-top: 15px; page-break-inside: avoid !important; break-inside: avoid !important;">
+          <h3 style="background: #2c3e50; color: #fff; padding: 6px 12px; margin: 0 0 8px 0; font-size: 14px; border-radius: 4px; font-weight: bold;">備考</h3>
+          <div style="border: 1px solid #dcdfe6; padding: 10px 12px 4px 12px; background: #ffffff; border-radius: 4px; color: #303133; font-size: 13.5px;">
+            ${bikouFormatted}
+          </div>
+        </div>
+      ` : '';
+
+      additionalContentHtml = kansouHtml + bikouHtml;
     }
 
-    // --- 【レイアウト構築】A4サイズに最適化した「非表示サンドボックス」HTML構造の定義 ---
-    // 注意：`position: absolute; left: 0; top: 0; z-index: -99999;` によって画面上は見えませんが、
-    // ドキュメント流の最上部に配置することで、html2canvasによるキャプチャ時のスクロールズレや余白の発生を完全に防止します。
     const reportHtml = `
       <div id="pdf-sandbox-container" style="position: absolute; left: 0; top: 0; width: 210mm; z-index: -99999; background: #ffffff; margin: 0; padding: 0; overflow: hidden; height: auto;">
         <style>
           #pdf-render-root, #pdf-render-root * {
             font-family: 'HG丸ｺﾞｼｯｸM-PRO', 'Hiragino Maru Gothic ProN', 'Meiryo', sans-serif !important;
             box-sizing: border-box;
+            word-break: break-all !important;
+            overflow-wrap: anywhere !important;
+          }
+
+          h3 {
+            page-break-after: avoid !important;
+            break-after: avoid !important;
+          }
+
+          .pdf-p-block {
+            page-break-inside: avoid !important;
+            break-inside: avoid !important;
           }
         </style>
-        <div id="pdf-render-root" style="width: 210mm; padding: 20mm 20mm; color: #333; line-height: 1.8; font-size: 14px; background: #ffffff;">
-          <!-- 報告書タイトル -->
-          <h1 style="text-align: center; font-size: 26px; margin: 0 0 35px 0; border-bottom: 2px solid #2c3e50; padding-bottom: 15px; color: #2c3e50;">${title}</h1>
-          
-          <!-- 基本情報テーブル（3行 × 2列 の格子状レイアウト） -->
-          <table style="width: 100%; border-collapse: collapse; margin-bottom: 35px; font-size: 13px;">
-            <tr>
-              <th style="border: 1px solid #bdc3c7; background: #f8f9fa; padding: 12px; width: 15%; text-align: left; font-weight: bold;">作成者</th>
-              <td style="border: 1px solid #bdc3c7; padding: 12px; width: 35%;">${author}</td>
-              <th style="border: 1px solid #bdc3c7; background: #f8f9fa; padding: 12px; width: 15%; text-align: left; font-weight: bold;">所属部署</th>
-              <td style="border: 1px solid #bdc3c7; padding: 12px; width: 35%;">${department}</td>
-            </tr>
-            <tr>
-              <th style="border: 1px solid #bdc3c7; background: #f8f9fa; padding: 12px; text-align: left; font-weight: bold;">対象</th>
-              <td style="border: 1px solid #bdc3c7; padding: 12px;">${target}</td>
-              <th style="border: 1px solid #bdc3c7; background: #f8f9fa; padding: 12px; text-align: left; font-weight: bold;">実施場所</th>
-              <td style="border: 1px solid #bdc3c7; padding: 12px;">${place}</td>
-            </tr>
-            <tr>
-              <th style="border: 1px solid #bdc3c7; background: #f8f9fa; padding: 12px; text-align: left; font-weight: bold;">実施開始日</th>
-              <td style="border: 1px solid #bdc3c7; padding: 12px;">${startDate}</td>
-              <th style="border: 1px solid #bdc3c7; background: #f8f9fa; padding: 12px; text-align: left; font-weight: bold;">実施終了日</th>
-              <td style="border: 1px solid #bdc3c7; padding: 12px;">${endDate}</td>
-            </tr>
-          </table>
 
-          <!-- 報告内容（リッチエディター出力用） -->
-          <div style="margin-top: 10px;">
-            <h3 style="background: #2c3e50; color: #fff; padding: 10px 15px; margin: 0 0 20px 0; font-size: 16px; border-radius: 4px; font-weight: bold;">報告内容</h3>
-            <div style="border: 1px solid #bdc3c7; padding: 30px; min-height: 400px; background: #ffffff; word-wrap: break-word;">
-              ${reportContent}
-            </div>
+        <div id="pdf-render-root" style="width: 210mm; padding: 0 20mm 5mm 20mm; color: #333; line-height: 1.5; font-size: 13.5px; background: #ffffff;">
+          
+          <div style="box-sizing: border-box; margin-bottom: 10px;">
+            <h1 style="text-align: center; font-size: 22px; margin: 0 0 15px 0; border-bottom: 2px solid #2c3e50; padding-bottom: 8px; color: #2c3e50; letter-spacing: 2px;">${appTitle}</h1>
+            ${middleTableHtml}
           </div>
 
-          <!-- 動的に判定された感想と備考のブロックを挿入（空の場合は何も出力されません） -->
-          ${kansouHtml}
-          ${bikouHtml}
+          ${mainBodyHtml}
+
+          ${additionalContentHtml}
+          
         </div>
       </div>
     `;
 
-    // 生成した一時的なHTML要素をドキュメントのbodyノードへ一時的にマウント（追加）
     const tempContainer = document.createElement('div');
     tempContainer.innerHTML = reportHtml;
     document.body.appendChild(tempContainer);
 
-    // --- html2pdf.js 専用の設定オプション ---
     const opt = {
-      margin:       0, // 外側余白をゼロに（HTML側のpaddingで制御するため）
-      filename:     `${title}.pdf`,
-      image:        { type: 'jpeg', quality: 0.98 }, // 画像化の画質設定
+      margin:        [22, 0, 12, 0],
+      filename:     `${appTitle}.pdf`,
+      image:        { type: 'jpeg', quality: 0.98 },
       html2canvas:  { 
-        scale: 2,           // 解像度の倍率。数値を上げると文字が鮮明になりますがファイルサイズが増加します
-        useCORS: true,      // クロスドメインの画像アセットが含まれる場合の許可設定
-        logging: false,     // コンソールログの出力を無効化
-        scrollY: 0,         // 【重要】kintone親画面のスクロール位置を無視し、絶対座標(0,0)からキャプチャを開始（空白ページ防止）
+        scale: 2, 
+        useCORS: true, 
+        logging: false, 
+        scrollY: 0, 
         scrollX: 0
       }, 
-      jsPDF:        { unit: 'mm', format: 'a4', orientation: 'portrait' }, // A4縦サイズ指定
-      pagebreak:    { mode: ['avoid-all', 'css', 'legacy'] } // 改ページ時の要素分断を防ぐ自動最適化アルゴリズム
+      jsPDF:        { unit: 'mm', format: 'a4', orientation: 'portrait' },
+      pagebreak:    { mode: ['css', 'legacy'] }
     };
 
-    // --- 非同期処理の同期実行およびレンダリング ---
-    const triggerRender = () => {
-      // ライブラリのロードが完了しているか再チェック
-      if (typeof html2pdf !== 'undefined') {
-        // サンドボックス内の描画ターゲット要素を取得
-        const targetEl = document.getElementById('pdf-render-root');
-        
-        // HTMLからPDFデータストリング（Base64）へ変換処理を実行
-        html2pdf().set(opt).from(targetEl).output('datauristring').then((pdfBase64) => {
-          // プレビュースペースをクリーンアップ
-          previewSpace.innerHTML = ''; 
-          
-          // インライン iframe を作成してPDFデータを流し込み、kintone画面上にプレビュー展開
-          const iframe = document.createElement('iframe');
-          iframe.style.width = '100%';
-          iframe.style.height = '800px'; 
-          iframe.style.border = '1px solid #dcdfe6';
-          iframe.style.boxShadow = '0 4px 16px rgba(0,0,0,0.08)';
-          iframe.src = pdfBase64;
-          
-          previewSpace.appendChild(iframe);
-          
-          // 処理が完了したため、DOM上の不要なサンドボックス用一時コンテナを完全に削除（メモリリーク防止）
-          if (document.body.contains(tempContainer)) {
-            document.body.removeChild(tempContainer);
-          }
-        }).catch((err) => {
-          // 万が一のエラー発生時のエラーメッセージ表示
-          previewSpace.innerHTML = '<div style="padding:20px; color:red;">PDF生成失敗: ' + err + '</div>';
-        });
-      } else {
-        // ロードが間に合っていない場合は、100ミリ秒後に再帰判定を行います
-        setTimeout(triggerRender, 100);
+    const cleanupAndReset = () => {
+      if (document.body.contains(tempContainer)) {
+        document.body.removeChild(tempContainer);
+      }
+      window.__pdfGenerating = false;
+      if (triggerBtn) {
+        triggerBtn.disabled = false;
+        triggerBtn.innerHTML = '📄 PDFプレビューを表示する';
+        triggerBtn.style.backgroundColor = '#2c3e50';
       }
     };
-    
-    // レンダリング実行のトリガーを引く
-    triggerRender();
+
+    const waitFontsReady = (document.fonts && document.fonts.ready)
+      ? document.fonts.ready
+      : Promise.resolve();
+
+    Promise.all([window.__html2pdfLoadPromise, waitFontsReady])
+      .then(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+      .then(() => {
+        const targetEl = document.getElementById('pdf-render-root');
+
+        return html2pdf().set(opt).from(targetEl).toPdf().get('pdf').then((pdf) => {
+          const totalPages = pdf.internal.getNumberOfPages();
+          const authorText = isTenmatsuStyle ? '報告者' : '作成者';
+          
+          for (let i = 1; i <= totalPages; i++) {
+            pdf.setPage(i);
+            
+            if (i > 1) {
+              const headerCanvas = document.createElement('canvas');
+              headerCanvas.width = 1600;
+              headerCanvas.height = 80;
+              const ctx = headerCanvas.getContext('2d');
+              
+              ctx.fillStyle = "#ffffff";
+              ctx.fillRect(0, 0, 1600, 80);
+              
+              ctx.font = "normal 24px sans-serif";
+              ctx.fillStyle = "#7f8c8d";
+              ctx.fillText(`${appTitle} (続紙)`, 0, 40);
+              
+              ctx.textAlign = "right";
+              ctx.fillText(`${authorText}: ${author}`, 1600, 40);
+              
+              ctx.strokeStyle = "#2c3e50";
+              ctx.lineWidth = 3;
+              ctx.beginPath();
+              ctx.moveTo(0, 60);
+              ctx.lineTo(1600, 60);
+              ctx.stroke();
+
+              const headerImgData = headerCanvas.toDataURL('image/png');
+              pdf.addImage(headerImgData, 'PNG', 20, 8, 170, 8.5);
+            }
+
+            pdf.setFontSize(10);
+            pdf.setTextColor(127, 140, 141);
+            pdf.text(`${i} / ${totalPages}`, 105, 289, { align: 'center' });
+          }
+
+          return pdf.output('blob');
+        });
+      })
+      .then((pdfBlob) => {
+        previewSpace.innerHTML = ''; 
+        
+        const blobUrl = URL.createObjectURL(pdfBlob);
+        const iframe = document.createElement('iframe');
+        iframe.style.width = '100%';
+        iframe.style.height = '800px'; 
+        iframe.style.border = '1px solid #dcdfe6';
+        iframe.style.boxShadow = '0 4px 16px rgba(0,0,0,0.08)';
+        iframe.src = blobUrl;
+        
+        previewSpace.appendChild(iframe);
+        cleanupAndReset();
+      })
+      .catch((err) => {
+        console.error(err);
+        previewSpace.innerHTML = '<div style="padding:20px; color:red; font-weight:bold;">PDF生成エラー: ' + (err.message || err) + '</div>';
+        cleanupAndReset();
+      });
   };
 })();
